@@ -1,0 +1,174 @@
+<div align="center">
+
+# ✻ clawdpilot
+
+**Pilotea cuatro agentes de Claude Code a la vez, en una sola pantalla.**
+
+Una TUI en Rust que abre cuatro terminales reales — un `claude` interactivo dentro de cada
+una — y te deja saltar entre ellos como si fueran las estaciones de un war room.
+
+</div>
+
+---
+
+## 📖 Qué es
+
+Trabajar con varios agentes en paralelo hoy significa varias ventanas, varias pestañas de tmux
+y ningún sitio desde donde verlo todo. `clawdpilot` pone cuatro sesiones de Claude Code en una
+rejilla 2×2 y te da un atajo para moverte entre ellas.
+
+No es un envoltorio ni una reimplementación de la interfaz de Claude: cada panel es un
+**pseudo-terminal de verdad** con el binario `claude` corriendo dentro. Ves su TUI tal cual —
+colores, el spinner, los prompts de permisos, los `/comandos`, el diálogo de "trust this folder".
+Todo lo que funciona en tu terminal funciona dentro de un panel.
+
+Cada agente puede trabajar en un directorio distinto, así que puedes tener uno refactorizando la
+API, otro escribiendo tests, otro leyendo un repo ajeno y el cuarto de reserva.
+
+---
+
+## ✨ Características
+
+- **Cuatro PTYs reales** — la TUI completa de Claude Code en cada panel, sin recortes
+- **Un directorio por agente** — por argumento al arrancar o cambiándolo en caliente con `^A c`
+- **Passthrough total de teclado** — lo que escribes llega al agente enfocado byte a byte,
+  incluidas flechas, `Esc`, `Tab` y combinaciones con `Ctrl`/`Alt`
+- **Pegado con bracketed paste** — pegar un prompt largo no dispara autocompletados raros
+- **Zoom** — expande el panel enfocado a pantalla completa cuando necesitas leer de verdad
+- **Reiniciar y matar** agentes sin salir de la aplicación
+- **Redimensionado en vivo** — al cambiar el tamaño de la ventana, cada PTY se reajusta solo
+- **Arranque perezoso** — los paneles empiezan en reposo; lanzas los agentes que quieras
+
+---
+
+## 🛠 Stack
+
+| Pieza | Tecnología |
+|-------|-----------|
+| Lenguaje | Rust 2024 |
+| Interfaz | [`ratatui`](https://ratatui.rs) + crossterm |
+| Terminales | [`portable-pty`](https://docs.rs/portable-pty) |
+| Emulación VT | [`vt100`](https://docs.rs/vt100) |
+| Errores | [`anyhow`](https://docs.rs/anyhow) |
+
+---
+
+## 📋 Requisitos
+
+- **Rust** >= 1.85 (edición 2024)
+- **Claude Code** instalado y accesible como `claude` en el `PATH`
+- Un terminal con soporte de 256 colores
+
+---
+
+## 🚀 Uso
+
+```bash
+cargo run --release
+```
+
+Los cuatro agentes arrancan sobre el directorio actual. Para repartirlos por proyecto:
+
+```bash
+cargo run --release -- ~/proyectos/api ~/proyectos/web ~/proyectos/docs
+```
+
+Se aceptan hasta cuatro rutas; las que falten heredan la primera. Cada ruta debe ser un
+directorio existente — si no, la aplicación se niega a arrancar en vez de dejarte un panel roto.
+
+Para instalarlo en el sistema:
+
+```bash
+cargo install --path .
+clawdpilot ~/proyectos/api ~/proyectos/web
+```
+
+---
+
+## ⌨️ Controles
+
+Con un agente vivo, **todas** las teclas le pertenecen a él. Por eso los comandos de la
+aplicación viven detrás de un prefijo estilo tmux: `Ctrl+A`.
+
+| Tecla | Acción |
+|-------|--------|
+| `Enter` | Lanza el agente del panel enfocado (solo si está en reposo) |
+| `Tab` | Siguiente panel (solo si el actual está en reposo) |
+| `Ctrl+A` | Entra en modo comando |
+
+Ya dentro del modo comando:
+
+| Tecla | Acción |
+|-------|--------|
+| `1` … `4` | Enfocar ese panel |
+| `Tab` | Siguiente panel |
+| `z` | Zoom del panel enfocado a pantalla completa |
+| `r` | Reiniciar el agente del panel |
+| `x` | Matar el agente y dejar el panel en reposo |
+| `c` | Cambiar el directorio de trabajo del panel |
+| `q` | Salir (mata los cuatro agentes) |
+| `Ctrl+A` | Enviar un `Ctrl+A` literal al agente |
+
+La barra inferior siempre muestra las teclas disponibles según dónde estés.
+
+---
+
+## ⚙️ Variables de entorno
+
+| Variable | Por defecto | Descripción |
+|----------|-------------|-------------|
+| `CLAWDPILOT_CLAUDE` | `claude` | Binario que se lanza en cada panel. Útil si tienes varias versiones instaladas o para pruebas. |
+
+---
+
+## 🔍 Cómo funciona
+
+```
+  teclado  ──►  encode_key  ──►  PTY master  ──►  claude
+                                                    │
+  pantalla ◄──  ratatui     ◄──  vt100 Parser  ◄────┘
+```
+
+`portable-pty` lanza `claude` en un pseudo-terminal del tamaño exacto del panel. Un hilo lector
+vuelca los bytes en un parser `vt100` compartido, que mantiene la pantalla del agente como una
+rejilla de celdas con sus atributos. En cada fotograma, el hilo de dibujo copia esa rejilla al
+búfer de `ratatui`, celda a celda, y coloca el cursor real del terminal donde lo tenga el panel
+enfocado.
+
+Al revés, cada tecla se traduce a los bytes que un `xterm` enviaría — `\r`, `0x7f`, `\x1b[A`,
+`Ctrl+letra` como byte de control — y se escribe en el maestro del PTY. El agente no distingue
+`clawdpilot` de un terminal normal.
+
+Son dos archivos: `src/pane.rs` (PTY, vt100 y el render de la rejilla) y `src/main.rs`
+(distribución, modos de teclado y bucle de eventos).
+
+---
+
+## 🧪 Desarrollo
+
+```bash
+cargo test              # rejilla, layout, modo comando y el camino PTY → búfer
+cargo clippy --all-targets
+```
+
+Hay además una prueba marcada como `ignored` que lanza el binario `claude` real y comprueba que
+su interfaz llega hasta el búfer de `ratatui`:
+
+```bash
+cargo test -- --ignored --nocapture
+```
+
+---
+
+## 🤝 Contribuir
+
+1. Crea una rama: `git checkout -b feat/lo-tuyo`
+2. Deja `cargo test` y `cargo clippy --all-targets` en verde
+3. Commitea siguiendo [Conventional Commits](https://www.conventionalcommits.org/es/)
+4. Abre un PR
+
+---
+
+<div align="center">
+Hecho con ☕ por <a href="https://franciscosolis.cl">Fran</a>
+</div>
