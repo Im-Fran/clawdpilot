@@ -58,8 +58,8 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [body, footer] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
-            .areas(frame.area());
+        let [body, footer] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
         let slots = self.layout(body);
         let mut cursor = None;
 
@@ -144,10 +144,8 @@ impl App {
             // con un agente vivo el teclado es suyo: Tab, flechas y Esc van al PTY
             Mode::Normal => &[("^A", "comandos")],
         };
-        let mut spans = vec![Span::styled(
-            if matches!(self.mode, Mode::Leader) { " ^A ─ " } else { " " },
-            key,
-        )];
+        let mut spans =
+            vec![Span::styled(if matches!(self.mode, Mode::Leader) { " ^A ─ " } else { " " }, key)];
         for (k, label) in hints {
             spans.push(Span::styled(*k, key));
             spans.push(Span::styled(format!(" {}  ", label), txt));
@@ -157,8 +155,7 @@ impl App {
 
     /// Tamaño interior del panel enfocado, para arrancar el PTY con la medida justa.
     fn focused_inner(&self, area: Rect) -> (u16, u16) {
-        let [body, _] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+        let [body, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
         let rect = self.layout(body)[self.focus];
         (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
     }
@@ -255,12 +252,9 @@ fn idle_card(focused: bool) -> Paragraph<'static> {
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let [_, row, _] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(height),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
+    let [_, row, _] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(height), Constraint::Fill(1)])
+            .areas(area);
     let [_, cell, _] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(width), Constraint::Fill(1)])
             .areas(row);
@@ -395,9 +389,14 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(76, 20)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
 
-        let screen: String = terminal.backend().buffer().content().chunks(76)
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(76)
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
-            .collect::<Vec<_>>().join("\n");
+            .collect::<Vec<_>>()
+            .join("\n");
         println!("{screen}");
 
         assert_eq!(screen.matches('✻').count(), 8, "4 títulos + 4 tarjetas idle");
