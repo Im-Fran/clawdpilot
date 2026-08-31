@@ -1,1 +1,16 @@
+# Rust
 /target
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+
+# Editores
+.idea/
+.vscode/
+*.swp
+
+# Entorno local
+.env
+.env.local

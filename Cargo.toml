@@ -3,6 +3,16 @@ name = "clawdpilot"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+description = "TUI en Rust para pilotar cuatro agentes de Claude Code en paralelo, en una rejilla 2x2 de PTYs reales"
+authors = ["Francisco Solis <https://franciscosolis.cl>"]
+license = "GPL-3.0-only"
+repository = "https://github.com/Im-Fran/clawdpilot"
+homepage = "https://github.com/Im-Fran/clawdpilot"
+readme = "README.md"
+keywords = ["tui", "terminal", "pty", "claude", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+# ponytail: se distribuye compilando desde el repo, no por crates.io
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"
