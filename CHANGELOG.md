@@ -9,6 +9,12 @@ a [Versionado Semántico](https://semver.org/lang/es/).
 
 ### Añadido
 
+- Barra lateral interactiva a la izquierda: logo, lista de paneles con el estado de cada agente
+  y las acciones con su atajo al lado. Cada fila se clica; `^A b` o un clic en el logo la pliega
+  a una columna de iconos, y una ventana estrecha la pliega sola
+- Indicador de actividad por panel: `○` en reposo, `●` con el agente listo y un spinner mientras
+  escribe, a partir de los bytes que llegan por el PTY
+
 - Soporte para otras IAs de terminal además de Claude Code: `^A a` abre una lista para elegir
   el agente del panel entre `claude`, `codex`, `agy` (Antigravity) y `aider`, y el título del
   panel muestra cuál corre
@@ -30,6 +36,7 @@ a [Versionado Semántico](https://semver.org/lang/es/).
 ### Cambiado
 
 - `^A x` sobre un panel ya en reposo ahora lo cierra, en vez de no hacer nada
+- El título de cada panel pasa a ser `número · agente · carpeta`; el `✻` vive ahora en el logo
 - Enfoque directo con `^A 1`…`^A 9` (antes `^A 1`…`^A 4`)
 - Se acabó el tope de cuatro directorios por línea de comandos: se abre un panel por ruta
 - Si el agente no se puede lanzar, se avisa en el footer en vez de cerrar la aplicación

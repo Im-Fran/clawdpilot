@@ -6,7 +6,9 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
@@ -14,8 +16,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
+/// Cuánto sigue contando como "trabajando" el último byte recibido del agente.
+const BUSY_FOR: Duration = Duration::from_millis(400);
+
 pub struct Session {
     parser: Arc<Mutex<vt100::Parser>>,
+    /// Bytes leídos del PTY. Que suba significa que el agente está escribiendo.
+    read: Arc<AtomicU64>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -37,7 +44,9 @@ impl Session {
         let writer = pair.master.take_writer()?;
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
 
+        let read = Arc::new(AtomicU64::new(0));
         let sink = Arc::clone(&parser);
+        let counter = Arc::clone(&read);
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = reader.read(&mut buf) {
@@ -45,10 +54,11 @@ impl Session {
                     break;
                 }
                 sink.lock().unwrap().process(&buf[..n]);
+                counter.fetch_add(n as u64, Ordering::Relaxed);
             }
         });
 
-        Ok(Session { parser, writer, master: pair.master, child, size: (rows, cols) })
+        Ok(Session { parser, read, writer, master: pair.master, child, size: (rows, cols) })
     }
 
     pub fn send(&mut self, bytes: &[u8]) {
@@ -63,6 +73,10 @@ impl Session {
         self.size = (rows, cols);
         let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.read.load(Ordering::Relaxed)
     }
 
     /// ¿La aplicación del PTY pidió que le reportemos el ratón?
@@ -149,11 +163,19 @@ pub struct Pane {
     pub session: Option<Session>,
     /// Índice en [`agents`]: qué IA de terminal arranca este panel.
     agent: usize,
+    /// Bytes ya contabilizados y hasta cuándo sigue marcado como ocupado.
+    seen: u64,
+    busy_until: Option<Instant>,
 }
 
 impl Pane {
     pub fn new(cwd: PathBuf) -> Self {
-        Pane { cwd, session: None, agent: 0 }
+        Pane { cwd, session: None, agent: 0, seen: 0, busy_until: None }
+    }
+
+    /// ¿El agente escribió algo hace nada? Es lo que enciende el spinner del sidebar.
+    pub fn is_busy(&self) -> bool {
+        self.busy_until.is_some_and(|until| until > Instant::now())
     }
 
     /// Comando completo del agente, con sus argumentos.
@@ -196,10 +218,19 @@ impl Pane {
         self.session = None; // Drop mata el hijo
     }
 
-    /// Limpia la sesión si el proceso murió por su cuenta (`/exit`, crash).
-    pub fn reap(&mut self) {
+    /// Una vez por fotograma: limpia la sesión si el proceso murió por su cuenta
+    /// (`/exit`, crash) y anota si el agente acaba de escribir.
+    pub fn tick(&mut self) {
         if self.session.as_mut().is_some_and(|s| !s.is_alive()) {
             self.session = None;
+            self.busy_until = None;
+        }
+        if let Some(session) = &self.session {
+            let read = session.bytes_read();
+            if read != self.seen {
+                self.seen = read;
+                self.busy_until = Some(Instant::now() + BUSY_FOR);
+            }
         }
     }
 }
@@ -291,6 +322,25 @@ mod tests {
 
         pane.agent = agents().iter().position(|a| a.contains(' ')).unwrap_or(0);
         assert!(!pane.agent_name().contains(' '), "el título no lleva argumentos");
+    }
+
+    /// La actividad del agente sale de los bytes que llegan por el PTY.
+    #[test]
+    fn a_pane_is_busy_right_after_its_agent_writes() {
+        let mut pane = Pane::new(std::env::temp_dir());
+        pane.tick();
+        assert!(!pane.is_busy(), "sin sesión no hay actividad");
+
+        // sigue vivo tras escribir: un agente muerto no está ocupado, está cosechado
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", "printf trabajando; sleep 30"]);
+        pane.session = Some(Session::spawn(cmd, 5, 20).unwrap());
+        drain_until(pane.session.as_ref().unwrap(), "trabajando");
+
+        pane.tick();
+        assert!(pane.is_busy(), "acaba de escribir");
+        std::thread::sleep(BUSY_FOR);
+        assert!(!pane.is_busy(), "y se apaga sola cuando calla");
     }
 
     /// Prueba manual contra el `claude` real: `cargo test -- --ignored --nocapture`

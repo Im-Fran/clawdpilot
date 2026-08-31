@@ -15,6 +15,29 @@ dentro de cada una — y te deja saltar entre ellos como si fueran las estacione
 
 ---
 
+```
+                       │┌ 1 claude · ~/api ────────────────┐┌ 2 codex · ~/web ─────────────────┐
+           ✻           ││ > implementa el endpoint de …    ││ ⣾ Pensando…                      │
+  c l a w d p i l o t  ││                                  ││                                  │
+                       ││                                  ││                                  │
+ PANELES               ││                                  ││                                  │
+ ▸1 claude   ⣾ api     ││                                  ││                                  │
+  2 codex    ● web     ││                                  ││                                  │
+  3 agy      ○ docs    ││                                  ││                                  │
+ + nuevo panel    ^A n │└──────────────────────────────────┘└──────────────────────────────────┘
+                       │┌ 3 agy · ~/docs ──────────────────┐┌ 4 · en reposo ───────────────────┐
+ ACCIONES              ││                                  ││                                  │
+ ▶ lanzar        Enter ││                                  ││                 ✻                │
+ ⟳ reiniciar      ^A r ││                                  ││              claude              │
+ ■ detener        ^A x ││                                  ││                                  │
+ ⌂ carpeta        ^A c ││                                  ││         Enter para lanzar        │
+ ⤢ zoom           ^A z ││                                  ││                                  │
+ ✻ agente         ^A a ││                                  ││                                  │
+                       ││                                  ││                                  │
+ ⏻ salir          ^A q │└──────────────────────────────────┘└──────────────────────────────────┘
+ ^A comandos
+```
+
 ## 📖 Qué es
 
 Trabajar con varios agentes en paralelo hoy significa varias ventanas, varias pestañas de tmux
@@ -33,10 +56,16 @@ Y no está casado con Claude Code: cada panel elige su agente de una lista con `
 Cada agente puede trabajar en un directorio distinto, así que puedes tener uno refactorizando la
 API, otro escribiendo tests, otro leyendo un repo ajeno y el cuarto de reserva.
 
+A la izquierda vive la barra lateral: el logo, la lista de paneles con el estado de cada agente
+—`○` en reposo, `●` listo, un spinner mientras escribe— y las acciones, cada una con su atajo al
+lado. Todo se puede clicar, y todo se puede teclear. `^A b` (o un clic en el `✻`) la pliega a una
+columna de iconos cuando quieres el ancho completo para los agentes.
+
 ---
 
 ## ✨ Características
 
+- **Barra lateral interactiva** — paneles, estado en vivo y acciones a un clic, plegable a dock
 - **PTYs reales** — la TUI completa del agente en cada panel, sin recortes
 - **Cualquier IA de terminal** — `^A a` abre una lista y eliges el agente panel por panel
 - **Ratón** — clic para enfocar un panel o su barra de título para cambiarle el agente; dentro
@@ -123,6 +152,7 @@ Ya dentro del modo comando:
 | `r` | Reiniciar el agente del panel |
 | `x` | Matar el agente; sobre un panel ya en reposo, cierra el panel |
 | `c` | Cambiar el directorio de trabajo del panel |
+| `b` | Plegar o desplegar la barra lateral |
 | `a` | Abrir la lista de agentes del panel (cambiarlo mata la sesión actual) |
 | `q` | Salir (mata los cuatro agentes) |
 | `Ctrl+A` | Enviar un `Ctrl+A` literal al agente |
@@ -141,6 +171,8 @@ Siempre queda al menos un panel abierto: `^A x` sobre el último no lo cierra.
 
 | Gesto | Acción |
 |-------|--------|
+| Clic en una fila de la barra lateral | Enfoca ese panel, o ejecuta esa acción |
+| Clic en el logo `✻` | Pliega o despliega la barra lateral |
 | Clic en un panel | Lo enfoca |
 | Clic en la barra de título de un panel | Abre su lista de agentes |
 | Clic en una fila de la lista | Elige ese agente; fuera de la lista, cancela |
@@ -186,8 +218,9 @@ Al revés, cada tecla se traduce a los bytes que un `xterm` enviaría — `\r`, 
 `Ctrl+letra` como byte de control — y se escribe en el maestro del PTY. El agente no distingue
 `clawdpilot` de un terminal normal.
 
-Son dos archivos: `src/pane.rs` (PTY, vt100 y el render de la rejilla) y `src/main.rs`
-(distribución, modos de teclado y bucle de eventos).
+Son tres archivos: `src/pane.rs` (PTY, vt100 y el render de la rejilla), `src/sidebar.rs` (la
+barra lateral, donde cada fila que se dibuja lleva pegado lo que hace al clicarla) y
+`src/main.rs` (distribución, modos de teclado, ratón y bucle de eventos).
 
 ---
 

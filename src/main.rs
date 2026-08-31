@@ -2,6 +2,7 @@
 //! `aider`... dentro, en una pantalla.
 
 mod pane;
+mod sidebar;
 
 use std::path::PathBuf;
 
@@ -18,13 +19,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use pane::{Pane, agents, short_path};
+use sidebar::{Item, Sidebar};
 
 const DEFAULT_PANES: usize = 4;
 /// Debajo de esto un panel no alcanza para leer nada: se rechaza crear más.
 const MIN_PANE_W: u16 = 20;
 const MIN_PANE_H: u16 = 6;
-const ACCENT: Color = Color::Rgb(217, 119, 87);
-const DIM: Color = Color::DarkGray;
+pub const ACCENT: Color = Color::Rgb(217, 119, 87);
+pub const DIM: Color = Color::DarkGray;
 
 enum Mode {
     Normal,
@@ -42,6 +44,9 @@ struct App {
     zoom: bool,
     mode: Mode,
     quit: bool,
+    sidebar: Sidebar,
+    /// Fotogramas dibujados; le da el ritmo al spinner de actividad.
+    tick: u64,
     /// Aviso efímero en el footer; se borra con la siguiente tecla.
     notice: Option<String>,
 }
@@ -52,7 +57,32 @@ impl App {
         let panes = (0..cwds.len().max(DEFAULT_PANES))
             .map(|i| Pane::new(cwds.get(i).cloned().unwrap_or_else(|| here.clone())))
             .collect();
-        App { panes, focus: 0, zoom: false, mode: Mode::Normal, quit: false, notice: None }
+        App {
+            panes,
+            focus: 0,
+            zoom: false,
+            mode: Mode::Normal,
+            quit: false,
+            sidebar: Sidebar::new(),
+            tick: 0,
+            notice: None,
+        }
+    }
+
+    /// Reparte la pantalla: barra lateral, rejilla de agentes y footer.
+    fn chrome(&self, area: Rect) -> (Rect, Rect, Rect) {
+        let [main, footer] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+        let [side, body] = Layout::horizontal([
+            Constraint::Length(self.sidebar.width(area.width)),
+            Constraint::Fill(1),
+        ])
+        .areas(main);
+        (side, body, footer)
+    }
+
+    fn body(&self, area: Rect) -> Rect {
+        self.chrome(area).1
     }
 
     /// Rectángulos de cada panel: rejilla lo más cuadrada posible, o uno solo si hay zoom.
@@ -75,8 +105,8 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [body, footer] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+        let (side, body, footer) = self.chrome(frame.area());
+        self.sidebar.render(side, frame, &self.panes, self.focus, self.tick);
         let slots = self.layout(body);
         let mut cursor = None;
 
@@ -88,9 +118,14 @@ impl App {
             let block = Block::bordered()
                 .border_style(Style::default().fg(if focused { ACCENT } else { DIM }))
                 .title(Line::from(vec![
-                    Span::styled(" ✻ ", Style::default().fg(ACCENT)),
                     Span::styled(
-                        format!("{} {}", self.panes[i].agent_name(), i + 1),
+                        format!(" {} ", i + 1),
+                        Style::default()
+                            .fg(if focused { ACCENT } else { DIM })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        self.panes[i].agent_name(),
                         Style::default().add_modifier(if focused {
                             Modifier::BOLD
                         } else {
@@ -182,6 +217,7 @@ impl App {
                 ("x", "matar"),
                 ("c", "carpeta"),
                 ("a", "agente"),
+                ("b", "lateral"),
                 ("q", "salir"),
             ],
             Mode::Leader => &[
@@ -191,6 +227,7 @@ impl App {
                 ("x", "cerrar panel"),
                 ("c", "carpeta"),
                 ("a", "agente"),
+                ("b", "lateral"),
                 ("q", "salir"),
                 ("^A", "literal"),
             ],
@@ -218,7 +255,7 @@ impl App {
 
     /// Añade un panel al final, heredando la carpeta del enfocado, y le da el foco.
     fn add_pane(&mut self, area: Rect) {
-        if !fits(self.panes.len() + 1, body_of(area)) {
+        if !fits(self.panes.len() + 1, self.body(area)) {
             self.notice = Some("no cabe otro panel en esta ventana".into());
             return;
         }
@@ -240,7 +277,7 @@ impl App {
 
     /// Tamaño interior del panel enfocado, para arrancar el PTY con la medida justa.
     fn focused_inner(&self, area: Rect) -> (u16, u16) {
-        let rect = self.layout(body_of(area))[self.focus];
+        let rect = self.layout(self.body(area))[self.focus];
         (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
     }
 
@@ -301,27 +338,16 @@ impl App {
                     }
                 }
                 KeyCode::Tab => self.focus = (self.focus + 1) % self.panes.len(),
-                KeyCode::Char('n') => self.add_pane(area),
-                KeyCode::Char('z') => self.zoom = !self.zoom,
-                KeyCode::Char('q') => self.quit = true,
-                // sobre un agente vivo `x` lo mata; sobre un panel en reposo, cierra el panel
-                KeyCode::Char('x') => {
-                    if self.panes[self.focus].session.is_some() {
-                        self.panes[self.focus].kill();
-                    } else {
-                        self.close_pane();
-                    }
-                }
-                KeyCode::Char('r') => {
-                    self.panes[self.focus].kill();
-                    self.launch_focused(area);
-                }
-                KeyCode::Char('c') => {
-                    self.mode = Mode::Cwd(short_path(&self.panes[self.focus].cwd));
-                }
+                KeyCode::Char('n') => self.act(Item::NewPane, area),
+                KeyCode::Char('z') => self.act(Item::Zoom, area),
+                KeyCode::Char('q') => self.act(Item::Quit, area),
+                KeyCode::Char('x') => self.act(Item::Kill, area),
+                KeyCode::Char('r') => self.act(Item::Restart, area),
+                KeyCode::Char('c') => self.act(Item::Cwd, area),
+                KeyCode::Char('b') => self.act(Item::Logo, area),
                 // el guard deja pasar ^A ^A al agente
                 KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.mode = Mode::Agents(self.panes[self.focus].agent_index());
+                    self.act(Item::Agent, area)
                 }
                 // Ctrl+A Ctrl+A envía un Ctrl+A de verdad al agente
                 _ => self.send_key(key),
@@ -340,6 +366,32 @@ impl App {
                     self.send_key(key);
                 }
             }
+        }
+    }
+
+    /// Un solo sitio donde ocurren las cosas: lo llaman igual el teclado y el sidebar.
+    fn act(&mut self, item: Item, area: Rect) {
+        match item {
+            Item::Logo => self.sidebar.toggle(),
+            Item::Pane(i) => self.focus = i.min(self.panes.len() - 1),
+            Item::NewPane => self.add_pane(area),
+            Item::Launch => self.launch_focused(area),
+            Item::Restart => {
+                self.panes[self.focus].kill();
+                self.launch_focused(area);
+            }
+            // sobre un agente vivo lo mata; sobre un panel en reposo, cierra el panel
+            Item::Kill => {
+                if self.panes[self.focus].session.is_some() {
+                    self.panes[self.focus].kill();
+                } else {
+                    self.close_pane();
+                }
+            }
+            Item::Cwd => self.mode = Mode::Cwd(short_path(&self.panes[self.focus].cwd)),
+            Item::Zoom => self.zoom = !self.zoom,
+            Item::Agent => self.mode = Mode::Agents(self.panes[self.focus].agent_index()),
+            Item::Quit => self.quit = true,
         }
     }
 
@@ -375,7 +427,19 @@ impl App {
             return;
         }
 
-        let slots = self.layout(body_of(area));
+        let (side, body, _) = self.chrome(area);
+        if inside(side) {
+            let over = self.sidebar.hit(side, m.column, m.row, &self.panes, self.focus);
+            self.sidebar.hover = over;
+            if let (MouseEventKind::Down(MouseButton::Left), Some(item)) = (m.kind, over) {
+                self.notice = None;
+                self.act(item, area);
+            }
+            return;
+        }
+        self.sidebar.hover = None;
+
+        let slots = self.layout(body);
         let Some(i) = slots.iter().position(|r| !r.is_empty() && inside(*r)) else { return };
         if matches!(m.kind, MouseEventKind::Down(_)) {
             self.notice = None;
@@ -427,12 +491,6 @@ fn idle_card(agent: &'static str, focused: bool) -> Paragraph<'static> {
         )),
     ])
     .centered()
-}
-
-/// Área de los paneles: todo menos la línea del footer.
-fn body_of(area: Rect) -> Rect {
-    let [body, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-    body
 }
 
 /// Columnas y filas para `n` paneles, tan cuadrado como se pueda: 4→2x2, 6→3x2, 9→3x3.
@@ -606,7 +664,8 @@ fn run(app: &mut App, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 _ => {}
             }
         }
-        app.panes.iter_mut().for_each(Pane::reap);
+        app.panes.iter_mut().for_each(Pane::tick);
+        app.tick += 1;
     }
     Ok(())
 }
@@ -636,8 +695,10 @@ mod tests {
             .join("\n");
         println!("{screen}");
 
-        assert_eq!(screen.matches('✻').count(), 8, "4 títulos + 4 tarjetas idle");
-        assert!(screen.contains("claude 4"), "el título lleva el agente del panel");
+        assert_eq!(screen.matches('✻').count(), 5, "el logo + una tarjeta idle por panel");
+        assert!(screen.contains(" 4 claude"), "el título lleva el número y el agente");
+        assert!(screen.contains("c l a w d p i l o t"), "el logo se queda mientras esté abierto");
+        assert!(screen.contains("▸1 claude"), "y el sidebar marca el panel enfocado");
         assert!(screen.contains("Enter para lanzar"), "solo el panel enfocado lo muestra");
     }
 
@@ -713,7 +774,7 @@ mod tests {
         let mut app = App::new(vec![PathBuf::from("/tmp")]);
         // 50 columnas dan dos paneles de 25, pero no los tres de 16 que pediría un quinto
         let area = Rect::new(0, 0, 50, 25);
-        assert!(fits(4, body_of(area)) && !fits(5, body_of(area)));
+        assert!(fits(4, app.body(area)) && !fits(5, app.body(area)));
 
         let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
         app.on_key(ctrl_a, area);
@@ -785,6 +846,124 @@ mod tests {
         assert!(screen.contains("✻ claude"), "el agente en uso va marcado");
     }
 
+    /// Clica la fila del sidebar donde vive `item`, buscándola con el mismo
+    /// hit-test que usa la aplicación.
+    fn click_item(app: &mut App, item: Item, area: Rect) {
+        let (side, ..) = app.chrome(area);
+        let y = (side.y..side.bottom())
+            .find(|&y| app.sidebar.hit(side, side.x + 1, y, &app.panes, app.focus) == Some(item))
+            .unwrap_or_else(|| panic!("{item:?} no aparece en el sidebar"));
+        click(app, MouseEventKind::Down(MouseButton::Left), side.x + 1, y, area);
+    }
+
+    /// Cada fila del sidebar hace exactamente lo que su atajo.
+    #[test]
+    fn the_sidebar_does_what_the_shortcuts_do() {
+        let mut app = App::new(vec![PathBuf::from("/tmp")]);
+        let area = Rect::new(0, 0, 120, 40);
+
+        click_item(&mut app, Item::Pane(2), area);
+        assert_eq!(app.focus, 2, "clic en la lista enfoca ese panel");
+
+        click_item(&mut app, Item::NewPane, area);
+        assert_eq!(app.panes.len(), 5);
+        assert_eq!(app.focus, 4);
+
+        click_item(&mut app, Item::Zoom, area);
+        assert!(app.zoom);
+
+        click_item(&mut app, Item::Agent, area);
+        assert!(matches!(app.mode, Mode::Agents(_)));
+        app.mode = Mode::Normal;
+
+        click_item(&mut app, Item::Kill, area);
+        assert_eq!(app.panes.len(), 4, "sobre un panel en reposo, cierra el panel");
+
+        click_item(&mut app, Item::Quit, area);
+        assert!(app.quit);
+    }
+
+    /// Lo que no se puede hacer no se puede clicar: sin agente vivo no hay reiniciar.
+    #[test]
+    fn actions_that_make_no_sense_are_not_clickable() {
+        let mut app = App::new(vec![PathBuf::from("/tmp")]);
+        app.panes.truncate(1);
+        let area = Rect::new(0, 0, 120, 40);
+        let (side, ..) = app.chrome(area);
+        let rows = || {
+            (side.y..side.bottom())
+                .filter_map(|y| app.sidebar.hit(side, side.x + 1, y, &app.panes, app.focus))
+                .collect::<Vec<_>>()
+        };
+
+        assert!(rows().contains(&Item::Launch), "en reposo se puede lanzar");
+        assert!(!rows().contains(&Item::Restart), "pero no reiniciar, no hay nada corriendo");
+        assert!(!rows().contains(&Item::Kill), "ni cerrar: es el último panel que queda");
+    }
+
+    /// El logo pliega y despliega, y una ventana estrecha lo pliega sola.
+    #[test]
+    fn the_sidebar_folds_into_a_dock() {
+        let mut app = App::new(vec![PathBuf::from("/tmp")]);
+        let area = Rect::new(0, 0, 120, 40);
+        assert_eq!(app.chrome(area).0.width, sidebar::WIDE);
+
+        click_item(&mut app, Item::Logo, area);
+        assert_eq!(app.chrome(area).0.width, sidebar::DOCK);
+        click_item(&mut app, Item::Logo, area);
+        assert_eq!(app.chrome(area).0.width, sidebar::WIDE);
+
+        let narrow = Rect::new(0, 0, sidebar::NARROW_WINDOW - 1, 40);
+        assert_eq!(app.chrome(narrow).0.width, sidebar::DOCK, "sin pedirlo, para no ahogar");
+    }
+
+    #[test]
+    #[ignore = "solo para regenerar el mockup del README"]
+    fn readme_screenshot() {
+        let mut app = App::new(vec![
+            PathBuf::from("/tmp/api"),
+            PathBuf::from("/tmp/web"),
+            PathBuf::from("/tmp/docs"),
+        ]);
+        app.panes[1].set_agent(1);
+        app.panes[2].set_agent(2);
+        app.focus = 0;
+        let mut terminal = Terminal::new(TestBackend::new(96, 26)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(96)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("{screen}");
+    }
+
+    /// Plegado se queda el logo y los estados, sin etiquetas.
+    #[test]
+    fn dock_keeps_the_logo_and_the_status_dots() {
+        let mut app = App::new(vec![PathBuf::from("/tmp")]);
+        app.sidebar.toggle();
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(60)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("{screen}");
+
+        assert!(screen.contains('✻'), "el logo se queda");
+        assert!(!screen.contains("c l a w d"), "el nombre no");
+        assert_eq!(screen.matches('○').count(), 4, "un punto de estado por panel");
+    }
+
     fn click(app: &mut App, kind: MouseEventKind, x: u16, y: u16, area: Rect) {
         app.on_mouse(
             MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::empty() },
@@ -797,7 +976,7 @@ mod tests {
     fn clicking_focuses_a_pane_and_its_title_opens_the_agent_list() {
         let mut app = App::new(vec![PathBuf::from("/tmp")]);
         let area = Rect::new(0, 0, 80, 25);
-        let bottom_right = app.layout(body_of(area))[3];
+        let bottom_right = app.layout(app.body(area))[3];
 
         click(
             &mut app,
