@@ -7,6 +7,10 @@
 Una TUI en Rust que abre cuatro terminales reales — un `claude` interactivo dentro de cada
 una — y te deja saltar entre ellos como si fueran las estaciones de un war room.
 
+[![CI](https://github.com/Im-Fran/clawdpilot/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/Im-Fran/clawdpilot/actions/workflows/ci.yml)
+[![Licencia: GPL v3](https://img.shields.io/badge/licencia-GPL--3.0-blue.svg)](LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+
 </div>
 
 ---
@@ -162,10 +166,24 @@ cargo test -- --ignored --nocapture
 
 ## 🤝 Contribuir
 
-1. Crea una rama: `git checkout -b feat/lo-tuyo`
-2. Deja `cargo test` y `cargo clippy --all-targets` en verde
+Las contribuciones son bienvenidas. Lee [CONTRIBUTING.md](CONTRIBUTING.md) para el flujo completo
+y [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) para las reglas de convivencia.
+
+En corto:
+
+1. Crea una rama desde `dev`: `git checkout -b feat/lo-tuyo`
+2. Deja `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings` y `cargo test` en verde
 3. Commitea siguiendo [Conventional Commits](https://www.conventionalcommits.org/es/)
-4. Abre un PR
+4. Abre un PR contra `dev`
+
+¿Encontraste un problema de seguridad? No abras un issue: sigue [SECURITY.md](SECURITY.md).
+
+---
+
+## 📄 Licencia
+
+[GNU General Public License v3.0](LICENSE) — puedes usar, modificar y redistribuir el proyecto,
+siempre que los trabajos derivados se publiquen bajo la misma licencia.
 
 ---
 
