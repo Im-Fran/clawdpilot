@@ -2,9 +2,9 @@
 
 # ✻ clawdpilot
 
-**Pilotea cuatro agentes de Claude Code a la vez, en una sola pantalla.**
+**Pilotea varios agentes de Claude Code a la vez, en una sola pantalla.**
 
-Una TUI en Rust que abre cuatro terminales reales — un `claude` interactivo dentro de cada
+Una TUI en Rust que abre terminales reales — un `claude` interactivo dentro de cada
 una — y te deja saltar entre ellos como si fueran las estaciones de un war room.
 
 [![CI](https://github.com/Im-Fran/clawdpilot/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/Im-Fran/clawdpilot/actions/workflows/ci.yml)
@@ -18,8 +18,9 @@ una — y te deja saltar entre ellos como si fueran las estaciones de un war roo
 ## 📖 Qué es
 
 Trabajar con varios agentes en paralelo hoy significa varias ventanas, varias pestañas de tmux
-y ningún sitio desde donde verlo todo. `clawdpilot` pone cuatro sesiones de Claude Code en una
-rejilla 2×2 y te da un atajo para moverte entre ellas.
+y ningún sitio desde donde verlo todo. `clawdpilot` pone tus sesiones de Claude Code en una
+rejilla y te da un atajo para moverte entre ellas. Arranca con cuatro y añades o cierras
+paneles sobre la marcha; la rejilla se reacomoda sola.
 
 No es un envoltorio ni una reimplementación de la interfaz de Claude: cada panel es un
 **pseudo-terminal de verdad** con el binario `claude` corriendo dentro. Ves su TUI tal cual —
@@ -33,7 +34,9 @@ API, otro escribiendo tests, otro leyendo un repo ajeno y el cuarto de reserva.
 
 ## ✨ Características
 
-- **Cuatro PTYs reales** — la TUI completa de Claude Code en cada panel, sin recortes
+- **PTYs reales** — la TUI completa de Claude Code en cada panel, sin recortes
+- **Paneles a demanda** — `^A n` añade uno, `^A x` cierra el enfocado; la rejilla se recalcula
+  sola (2×2, 3×2, 3×3…) y se niega a crear paneles que quedarían ilegibles
 - **Un directorio por agente** — por argumento al arrancar o cambiándolo en caliente con `^A c`
 - **Passthrough total de teclado** — lo que escribes llega al agente enfocado byte a byte,
   incluidas flechas, `Esc`, `Tab` y combinaciones con `Ctrl`/`Alt`
@@ -71,14 +74,17 @@ API, otro escribiendo tests, otro leyendo un repo ajeno y el cuarto de reserva.
 cargo run --release
 ```
 
-Los cuatro agentes arrancan sobre el directorio actual. Para repartirlos por proyecto:
+Arranca con cuatro agentes sobre el directorio actual. Para repartirlos por proyecto:
 
 ```bash
 cargo run --release -- ~/proyectos/api ~/proyectos/web ~/proyectos/docs
 ```
 
-Se aceptan hasta cuatro rutas; las que falten heredan la primera. Cada ruta debe ser un
-directorio existente — si no, la aplicación se niega a arrancar en vez de dejarte un panel roto.
+Cada ruta abre su panel. Si pasas más de cuatro, la rejilla crece; si pasas menos, los paneles
+restantes heredan la primera ruta. Cada ruta debe ser un directorio existente — si no, la
+aplicación se niega a arrancar en vez de dejarte un panel roto.
+
+Con la sesión ya abierta, `^A n` añade paneles y `^A x` los cierra.
 
 Para instalarlo en el sistema:
 
@@ -104,16 +110,20 @@ Ya dentro del modo comando:
 
 | Tecla | Acción |
 |-------|--------|
-| `1` … `4` | Enfocar ese panel |
+| `1` … `9` | Enfocar ese panel |
 | `Tab` | Siguiente panel |
+| `n` | Nuevo panel, heredando la carpeta del enfocado |
 | `z` | Zoom del panel enfocado a pantalla completa |
 | `r` | Reiniciar el agente del panel |
-| `x` | Matar el agente y dejar el panel en reposo |
+| `x` | Matar el agente; sobre un panel ya en reposo, cierra el panel |
 | `c` | Cambiar el directorio de trabajo del panel |
 | `q` | Salir (mata los cuatro agentes) |
 | `Ctrl+A` | Enviar un `Ctrl+A` literal al agente |
 
-La barra inferior siempre muestra las teclas disponibles según dónde estés.
+La barra inferior siempre muestra las teclas disponibles según dónde estés, y avisa en amarillo
+cuando una acción no se puede hacer — por ejemplo si ya no cabe otro panel.
+
+Siempre queda al menos un panel abierto: `^A x` sobre el último no lo cierra.
 
 ---
 
@@ -132,6 +142,11 @@ La barra inferior siempre muestra las teclas disponibles según dónde estés.
                                                     │
   pantalla ◄──  ratatui     ◄──  vt100 Parser  ◄────┘
 ```
+
+La rejilla es la más cuadrada que quepa: para `n` paneles se usan `ceil(sqrt(n))` columnas, y la
+última fila reparte a lo ancho los que le quedan. Antes de añadir un panel se comprueba que
+todos seguirían midiendo al menos 20×6; si no, la acción se rechaza en vez de dejarte una
+cuadrícula ilegible.
 
 `portable-pty` lanza `claude` en un pseudo-terminal del tamaño exacto del panel. Un hilo lector
 vuelca los bytes en un parser `vt100` compartido, que mantiene la pantalla del agente como una

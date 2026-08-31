@@ -1,4 +1,4 @@
-//! clawdpilot — war room de agentes Claude: 4 PTYs con `claude` dentro, en una pantalla.
+//! clawdpilot — war room de agentes Claude: N PTYs con `claude` dentro, en una pantalla.
 
 mod pane;
 
@@ -18,7 +18,10 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 
 use pane::{Pane, short_path};
 
-const PANES: usize = 4;
+const DEFAULT_PANES: usize = 4;
+/// Debajo de esto un panel no alcanza para leer nada: se rechaza crear más.
+const MIN_PANE_W: u16 = 20;
+const MIN_PANE_H: u16 = 6;
 const ACCENT: Color = Color::Rgb(217, 119, 87);
 const DIM: Color = Color::DarkGray;
 
@@ -36,25 +39,36 @@ struct App {
     zoom: bool,
     mode: Mode,
     quit: bool,
+    /// Aviso efímero en el footer; se borra con la siguiente tecla.
+    notice: Option<&'static str>,
 }
 
 impl App {
     fn new(cwds: Vec<PathBuf>) -> Self {
         let here = cwds.first().cloned().unwrap_or_default();
-        let panes = (0..PANES)
+        let panes = (0..cwds.len().max(DEFAULT_PANES))
             .map(|i| Pane::new(cwds.get(i).cloned().unwrap_or_else(|| here.clone())))
             .collect();
-        App { panes, focus: 0, zoom: false, mode: Mode::Normal, quit: false }
+        App { panes, focus: 0, zoom: false, mode: Mode::Normal, quit: false, notice: None }
     }
 
-    /// Rectángulos de cada panel: rejilla 2x2, o uno solo si hay zoom.
+    /// Rectángulos de cada panel: rejilla lo más cuadrada posible, o uno solo si hay zoom.
     fn layout(&self, area: Rect) -> Vec<Rect> {
+        let n = self.panes.len();
         if self.zoom {
-            return (0..PANES).map(|i| if i == self.focus { area } else { Rect::ZERO }).collect();
+            return (0..n).map(|i| if i == self.focus { area } else { Rect::ZERO }).collect();
         }
-        let half = Constraint::from_percentages([50, 50]);
-        let rows = Layout::vertical(half.clone()).split(area);
-        rows.iter().flat_map(|r| Layout::horizontal(half.clone()).split(*r).to_vec()).collect()
+        let (cols, rows) = grid_shape(n);
+        let bands = Layout::vertical(vec![Constraint::Fill(1); rows]).split(area);
+        let mut slots = Vec::with_capacity(n);
+        for (r, band) in bands.iter().enumerate() {
+            // la última fila reparte a lo ancho solo los paneles que le quedan
+            let in_row = (n - r * cols).min(cols);
+            slots.extend(
+                Layout::horizontal(vec![Constraint::Fill(1); in_row]).split(*band).iter().copied(),
+            );
+        }
+        slots
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -128,11 +142,21 @@ impl App {
         let key = Style::default().fg(ACCENT);
         let txt = Style::default().fg(DIM);
         let hints: &[(&str, &str)] = match self.mode {
-            Mode::Leader => &[
-                ("1-4/Tab", "foco"),
+            // `x` mata al agente vivo; sobre un panel en reposo, lo cierra
+            Mode::Leader if self.panes[self.focus].session.is_some() => &[
+                ("1-9/Tab", "foco"),
+                ("n", "nuevo"),
                 ("z", "zoom"),
                 ("r", "reiniciar"),
                 ("x", "matar"),
+                ("c", "carpeta"),
+                ("q", "salir"),
+            ],
+            Mode::Leader => &[
+                ("1-9/Tab", "foco"),
+                ("n", "nuevo"),
+                ("z", "zoom"),
+                ("x", "cerrar panel"),
                 ("c", "carpeta"),
                 ("q", "salir"),
                 ("^A", "literal"),
@@ -150,13 +174,37 @@ impl App {
             spans.push(Span::styled(*k, key));
             spans.push(Span::styled(format!(" {}  ", label), txt));
         }
+        if let Some(notice) = self.notice {
+            spans.push(Span::styled(format!("· {notice}"), Style::default().fg(Color::Yellow)));
+        }
         Line::from(spans)
+    }
+
+    /// Añade un panel al final, heredando la carpeta del enfocado, y le da el foco.
+    fn add_pane(&mut self, area: Rect) {
+        if !fits(self.panes.len() + 1, body_of(area)) {
+            self.notice = Some("no cabe otro panel en esta ventana");
+            return;
+        }
+        let cwd = self.panes[self.focus].cwd.clone();
+        self.panes.push(Pane::new(cwd));
+        self.focus = self.panes.len() - 1;
+        self.zoom = false;
+    }
+
+    /// Cierra el panel enfocado. Siempre queda al menos uno.
+    fn close_pane(&mut self) {
+        if self.panes.len() == 1 {
+            self.notice = Some("no puedes cerrar el último panel");
+            return;
+        }
+        self.panes.remove(self.focus); // Drop mata la sesión si la hubiera
+        self.focus = self.focus.min(self.panes.len() - 1);
     }
 
     /// Tamaño interior del panel enfocado, para arrancar el PTY con la medida justa.
     fn focused_inner(&self, area: Rect) -> (u16, u16) {
-        let [body, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-        let rect = self.layout(body)[self.focus];
+        let rect = self.layout(body_of(area))[self.focus];
         (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
     }
 
@@ -170,6 +218,7 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent, area: Rect) {
+        self.notice = None;
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Cwd(mut input) => match key.code {
                 KeyCode::Enter => {
@@ -194,11 +243,24 @@ impl App {
             },
 
             Mode::Leader => match key.code {
-                KeyCode::Char(c @ '1'..='4') => self.focus = c as usize - '1' as usize,
-                KeyCode::Tab => self.focus = (self.focus + 1) % PANES,
+                KeyCode::Char(c @ '1'..='9') => {
+                    let i = c as usize - '1' as usize;
+                    if i < self.panes.len() {
+                        self.focus = i;
+                    }
+                }
+                KeyCode::Tab => self.focus = (self.focus + 1) % self.panes.len(),
+                KeyCode::Char('n') => self.add_pane(area),
                 KeyCode::Char('z') => self.zoom = !self.zoom,
                 KeyCode::Char('q') => self.quit = true,
-                KeyCode::Char('x') => self.panes[self.focus].kill(),
+                // sobre un agente vivo `x` lo mata; sobre un panel en reposo, cierra el panel
+                KeyCode::Char('x') => {
+                    if self.panes[self.focus].session.is_some() {
+                        self.panes[self.focus].kill();
+                    } else {
+                        self.close_pane();
+                    }
+                }
                 KeyCode::Char('r') => {
                     self.panes[self.focus].kill();
                     self.launch_focused(area);
@@ -216,7 +278,7 @@ impl App {
                 } else if self.panes[self.focus].session.is_none() {
                     match key.code {
                         KeyCode::Enter => self.launch_focused(area),
-                        KeyCode::Tab => self.focus = (self.focus + 1) % PANES,
+                        KeyCode::Tab => self.focus = (self.focus + 1) % self.panes.len(),
                         _ => {}
                     }
                 } else {
@@ -249,6 +311,24 @@ fn idle_card(focused: bool) -> Paragraph<'static> {
         )),
     ])
     .centered()
+}
+
+/// Área de los paneles: todo menos la línea del footer.
+fn body_of(area: Rect) -> Rect {
+    let [body, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    body
+}
+
+/// Columnas y filas para `n` paneles, tan cuadrado como se pueda: 4→2x2, 6→3x2, 9→3x3.
+fn grid_shape(n: usize) -> (usize, usize) {
+    let cols = (n as f64).sqrt().ceil() as usize;
+    (cols.max(1), n.div_ceil(cols.max(1)).max(1))
+}
+
+/// ¿Caben `n` paneles en `area` sin dejarlos ilegibles?
+fn fits(n: usize, area: Rect) -> bool {
+    let (cols, rows) = grid_shape(n);
+    area.width / cols as u16 >= MIN_PANE_W && area.height / rows as u16 >= MIN_PANE_H
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -326,16 +406,13 @@ fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `clawdpilot [dir1 [dir2 [dir3 [dir4]]]]` — sin argumentos, los cuatro
-/// agentes comparten el directorio actual.
+/// `clawdpilot [dir...]` — un panel por directorio, con un mínimo de
+/// `DEFAULT_PANES`. Sin argumentos, todos comparten el directorio actual.
 fn cwds_from_args() -> Result<Vec<PathBuf>> {
     let mut cwds = vec![];
     for arg in std::env::args().skip(1) {
         let path = expand_home(&arg).canonicalize().ok().filter(|p| p.is_dir());
         cwds.push(path.ok_or_else(|| anyhow::anyhow!("no es un directorio: {arg}"))?);
-    }
-    if cwds.len() > PANES {
-        anyhow::bail!("como máximo {PANES} directorios, recibí {}", cwds.len());
     }
     if cwds.is_empty() {
         cwds.push(std::env::current_dir()?);
@@ -378,6 +455,8 @@ fn run(app: &mut App, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -423,6 +502,82 @@ mod tests {
         app.on_key(ctrl_a, area);
         app.on_key(KeyEvent::from(KeyCode::Char('z')), area);
         assert!(app.zoom);
+    }
+
+    /// La rejilla se recalcula al crecer y ninguna celda se solapa ni se sale.
+    #[test]
+    fn grid_reshapes_as_panes_are_added() {
+        assert_eq!(grid_shape(1), (1, 1));
+        assert_eq!(grid_shape(2), (2, 1));
+        assert_eq!(grid_shape(4), (2, 2));
+        assert_eq!(grid_shape(6), (3, 2));
+        assert_eq!(grid_shape(9), (3, 3));
+
+        let area = Rect::new(0, 0, 150, 60);
+        for n in 1..=9 {
+            let mut app = App::new(vec![PathBuf::from("/tmp")]);
+            app.panes.resize_with(n, || Pane::new(PathBuf::from("/tmp")));
+            let slots = app.layout(area);
+
+            assert_eq!(slots.len(), n, "un rectángulo por panel");
+            let covered: u32 = slots.iter().map(|r| r.area()).sum();
+            assert_eq!(covered, area.area(), "la rejilla cubre todo sin solaparse ({n})");
+            assert!(slots.iter().all(|r| area.union(*r) == area), "ninguna celda se sale ({n})");
+        }
+    }
+
+    #[test]
+    fn new_pane_inherits_the_cwd_and_takes_focus() {
+        let mut app = App::new(vec![PathBuf::from("/tmp")]);
+        let area = Rect::new(0, 0, 150, 60);
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+        app.panes[0].cwd = PathBuf::from("/usr");
+        app.on_key(ctrl_a, area);
+        app.on_key(KeyEvent::from(KeyCode::Char('n')), area);
+
+        assert_eq!(app.panes.len(), 5);
+        assert_eq!(app.focus, 4, "el panel nuevo queda enfocado");
+        assert_eq!(app.panes[4].cwd, PathBuf::from("/usr"), "hereda la carpeta del enfocado");
+    }
+
+    #[test]
+    fn refuses_to_add_a_pane_that_would_not_fit() {
+        let mut app = App::new(vec![PathBuf::from("/tmp")]);
+        // 50 columnas dan dos paneles de 25, pero no los tres de 16 que pediría un quinto
+        let area = Rect::new(0, 0, 50, 25);
+        assert!(fits(4, body_of(area)) && !fits(5, body_of(area)));
+
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_a, area);
+        app.on_key(KeyEvent::from(KeyCode::Char('n')), area);
+
+        assert_eq!(app.panes.len(), 4, "no se añade");
+        assert!(app.notice.is_some(), "y el footer lo dice en vez de callarse");
+    }
+
+    /// `^A x` mata al agente vivo; repetido sobre el panel en reposo, lo cierra.
+    #[test]
+    fn x_closes_an_idle_pane_but_never_the_last_one() {
+        let mut app = App::new(vec![PathBuf::from("/tmp")]);
+        let area = Rect::new(0, 0, 150, 60);
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let close = |app: &mut App| {
+            app.on_key(ctrl_a, area);
+            app.on_key(KeyEvent::from(KeyCode::Char('x')), area);
+        };
+
+        app.focus = 1;
+        app.panes[1].cwd = PathBuf::from("/usr");
+        close(&mut app);
+        assert_eq!(app.panes.len(), 3);
+        assert!(app.panes.iter().all(|p| p.cwd != Path::new("/usr")), "cerró el enfocado");
+
+        for _ in 0..5 {
+            close(&mut app);
+        }
+        assert_eq!(app.panes.len(), 1, "el último panel no se cierra");
+        assert_eq!(app.focus, 0);
     }
 
     #[test]
