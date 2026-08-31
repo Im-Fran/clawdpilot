@@ -1,11 +1,12 @@
-//! Un panel = un `claude` corriendo dentro de un pseudo-terminal.
+//! Un panel = un agente de terminal (`claude`, `codex`, `aider`...) corriendo
+//! dentro de un pseudo-terminal.
 //!
 //! El hilo lector vuelca los bytes del PTY en un parser vt100 compartido;
 //! el hilo de render lee la grilla resultante y la pinta en ratatui.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
@@ -62,6 +63,15 @@ impl Session {
         self.size = (rows, cols);
         let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
+    }
+
+    /// ¿La aplicación del PTY pidió que le reportemos el ratón?
+    pub fn wants_mouse(&self) -> bool {
+        let parser = self.parser.lock().unwrap();
+        let screen = parser.screen();
+        // ponytail: solo SGR (1006), que es lo que negocian las TUIs de hoy
+        screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
+            && screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr
     }
 
     pub fn is_alive(&mut self) -> bool {
@@ -137,17 +147,46 @@ fn color(c: vt100::Color) -> Color {
 pub struct Pane {
     pub cwd: PathBuf,
     pub session: Option<Session>,
+    /// Índice en [`agents`]: qué IA de terminal arranca este panel.
+    agent: usize,
 }
 
 impl Pane {
     pub fn new(cwd: PathBuf) -> Self {
-        Pane { cwd, session: None }
+        Pane { cwd, session: None, agent: 0 }
+    }
+
+    /// Comando completo del agente, con sus argumentos.
+    pub fn agent_cmd(&self) -> &'static str {
+        &agents()[self.agent]
+    }
+
+    /// Nombre corto para el título: el programa, sin argumentos ni ruta.
+    pub fn agent_name(&self) -> &'static str {
+        let prog = self.agent_cmd().split_whitespace().next().unwrap_or("agent");
+        prog.rsplit('/').next().unwrap_or(prog)
+    }
+
+    pub fn agent_index(&self) -> usize {
+        self.agent
+    }
+
+    /// Elige otro agente de la lista. Mata la sesión: el cambio se ve al relanzar.
+    pub fn set_agent(&mut self, i: usize) {
+        if i >= agents().len() || i == self.agent {
+            return;
+        }
+        self.kill();
+        self.agent = i;
     }
 
     pub fn launch(&mut self, rows: u16, cols: u16) -> Result<()> {
-        let mut cmd = CommandBuilder::new(claude_bin());
+        // ponytail: split por espacios, sin comillas; para algo más raro, un wrapper en el PATH
+        let mut argv = self.agent_cmd().split_whitespace();
+        let mut cmd = CommandBuilder::new(argv.next().unwrap_or("claude"));
+        cmd.args(argv);
         cmd.cwd(&self.cwd);
-        // vt100 no habla truecolor por índice; xterm-256color es lo que la TUI de Claude espera
+        // vt100 no habla truecolor por índice; xterm-256color es lo que esperan estas TUIs
         cmd.env("TERM", "xterm-256color");
         self.session = Some(Session::spawn(cmd, rows.max(1), cols.max(1))?);
         Ok(())
@@ -165,8 +204,26 @@ impl Pane {
     }
 }
 
-fn claude_bin() -> String {
-    std::env::var("CLAWDPILOT_CLAUDE").unwrap_or_else(|_| "claude".into())
+/// Agentes disponibles, en el orden en que los cicla `^A a`. Se sobrescriben con
+/// `CLAWDPILOT_AGENTS`, una lista separada por comas donde cada entrada es un
+/// comando con sus argumentos: `CLAWDPILOT_AGENTS="claude --continue,codex,aider"`.
+pub fn agents() -> &'static [String] {
+    static AGENTS: OnceLock<Vec<String>> = OnceLock::new();
+    AGENTS.get_or_init(|| parse_agents(std::env::var("CLAWDPILOT_AGENTS").ok()))
+}
+
+fn parse_agents(raw: Option<String>) -> Vec<String> {
+    let listed: Vec<String> = raw
+        .iter()
+        .flat_map(|v| v.split(','))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if listed.is_empty() {
+        ["claude", "codex", "agy", "aider"].map(String::from).to_vec()
+    } else {
+        listed
+    }
 }
 
 pub fn short_path(p: &Path) -> String {
@@ -208,6 +265,32 @@ mod tests {
         let row: String = (0..24).map(|x| buf.cell((x, 1)).unwrap().symbol()).collect();
         assert_eq!(row.trim_end(), "  hola mundo");
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), " ", "no debe pintar fuera del área");
+    }
+
+    #[test]
+    fn agent_list_falls_back_to_the_defaults() {
+        assert_eq!(
+            parse_agents(Some("codex, aider --model x ,,".into())),
+            ["codex", "aider --model x"]
+        );
+        assert_eq!(parse_agents(Some("  ,, ".into()))[0], "claude");
+        assert!(parse_agents(None).len() > 1, "hay algo que ciclar con ^A a");
+    }
+
+    #[test]
+    fn set_agent_picks_from_the_list_and_ignores_the_impossible() {
+        let mut pane = Pane::new(PathBuf::from("/tmp"));
+        let first = pane.agent_cmd();
+
+        pane.set_agent(agents().len() - 1);
+        assert_ne!(pane.agent_cmd(), first);
+        assert_eq!(pane.agent_index(), agents().len() - 1);
+
+        pane.set_agent(agents().len()); // fuera de rango: se queda como estaba
+        assert_eq!(pane.agent_index(), agents().len() - 1);
+
+        pane.agent = agents().iter().position(|a| a.contains(' ')).unwrap_or(0);
+        assert!(!pane.agent_name().contains(' '), "el título no lleva argumentos");
     }
 
     /// Prueba manual contra el `claude` real: `cargo test -- --ignored --nocapture`

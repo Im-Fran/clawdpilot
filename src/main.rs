@@ -1,4 +1,5 @@
-//! clawdpilot — war room de agentes Claude: N PTYs con `claude` dentro, en una pantalla.
+//! clawdpilot — war room de agentes de terminal: N PTYs con `claude`, `codex`,
+//! `aider`... dentro, en una pantalla.
 
 mod pane;
 
@@ -7,8 +8,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use ratatui::Frame;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -16,7 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use pane::{Pane, short_path};
+use pane::{Pane, agents, short_path};
 
 const DEFAULT_PANES: usize = 4;
 /// Debajo de esto un panel no alcanza para leer nada: se rechaza crear más.
@@ -31,6 +32,8 @@ enum Mode {
     Leader,
     /// Editando el directorio de trabajo del panel enfocado.
     Cwd(String),
+    /// Eligiendo agente para el panel enfocado; guarda la fila resaltada.
+    Agents(usize),
 }
 
 struct App {
@@ -40,7 +43,7 @@ struct App {
     mode: Mode,
     quit: bool,
     /// Aviso efímero en el footer; se borra con la siguiente tecla.
-    notice: Option<&'static str>,
+    notice: Option<String>,
 }
 
 impl App {
@@ -87,7 +90,7 @@ impl App {
                 .title(Line::from(vec![
                     Span::styled(" ✻ ", Style::default().fg(ACCENT)),
                     Span::styled(
-                        format!("agent {}", i + 1),
+                        format!("{} {}", self.panes[i].agent_name(), i + 1),
                         Style::default().add_modifier(if focused {
                             Modifier::BOLD
                         } else {
@@ -113,7 +116,7 @@ impl App {
                         cursor = Some(pos);
                     }
                 }
-                None => frame.render_widget(idle_card(focused), inner),
+                None => frame.render_widget(idle_card(self.panes[i].agent_name(), focused), inner),
             }
         }
 
@@ -121,6 +124,34 @@ impl App {
             frame.set_cursor_position(pos);
         }
         frame.render_widget(self.footer(), footer);
+
+        if let Mode::Agents(sel) = self.mode {
+            let popup = agents_popup(frame.area());
+            frame.render_widget(Clear, popup);
+            let block = Block::bordered()
+                .border_style(Style::default().fg(ACCENT))
+                .title(format!(" agente del panel {} ", self.focus + 1));
+            let inner = block.inner(popup);
+            frame.render_widget(block, popup);
+
+            let current = self.panes[self.focus].agent_index();
+            let rows: Vec<Line> = agents()
+                .iter()
+                .enumerate()
+                .map(|(i, cmd)| {
+                    let mark = if i == current { "✻ " } else { "  " };
+                    let style = if i == sel {
+                        Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED)
+                    } else if i == current {
+                        Style::default().fg(ACCENT)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(Span::styled(format!("{mark}{cmd}"), style))
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(rows), inner);
+        }
 
         if let Mode::Cwd(input) = &self.mode {
             let popup = centered(frame.area(), 60, 3);
@@ -150,6 +181,7 @@ impl App {
                 ("r", "reiniciar"),
                 ("x", "matar"),
                 ("c", "carpeta"),
+                ("a", "agente"),
                 ("q", "salir"),
             ],
             Mode::Leader => &[
@@ -158,10 +190,14 @@ impl App {
                 ("z", "zoom"),
                 ("x", "cerrar panel"),
                 ("c", "carpeta"),
+                ("a", "agente"),
                 ("q", "salir"),
                 ("^A", "literal"),
             ],
             Mode::Cwd(_) => &[("Enter", "confirmar"), ("Esc", "cancelar")],
+            Mode::Agents(_) => {
+                &[("↑↓/click", "elegir"), ("Enter", "confirmar"), ("Esc", "cancelar")]
+            }
             Mode::Normal if self.panes[self.focus].session.is_none() => {
                 &[("Enter", "lanzar agente"), ("Tab", "siguiente panel"), ("^A", "comandos")]
             }
@@ -174,7 +210,7 @@ impl App {
             spans.push(Span::styled(*k, key));
             spans.push(Span::styled(format!(" {}  ", label), txt));
         }
-        if let Some(notice) = self.notice {
+        if let Some(notice) = &self.notice {
             spans.push(Span::styled(format!("· {notice}"), Style::default().fg(Color::Yellow)));
         }
         Line::from(spans)
@@ -183,7 +219,7 @@ impl App {
     /// Añade un panel al final, heredando la carpeta del enfocado, y le da el foco.
     fn add_pane(&mut self, area: Rect) {
         if !fits(self.panes.len() + 1, body_of(area)) {
-            self.notice = Some("no cabe otro panel en esta ventana");
+            self.notice = Some("no cabe otro panel en esta ventana".into());
             return;
         }
         let cwd = self.panes[self.focus].cwd.clone();
@@ -195,7 +231,7 @@ impl App {
     /// Cierra el panel enfocado. Siempre queda al menos uno.
     fn close_pane(&mut self) {
         if self.panes.len() == 1 {
-            self.notice = Some("no puedes cerrar el último panel");
+            self.notice = Some("no puedes cerrar el último panel".into());
             return;
         }
         self.panes.remove(self.focus); // Drop mata la sesión si la hubiera
@@ -210,10 +246,10 @@ impl App {
 
     fn launch_focused(&mut self, area: Rect) {
         let (rows, cols) = self.focused_inner(area);
-        if let Err(e) = self.panes[self.focus].launch(rows, cols) {
-            // sin `claude` en el PATH no hay nada que pilotar; mejor salir con el error visible
-            self.quit = true;
-            eprintln!("clawdpilot: no se pudo lanzar claude: {e}");
+        if self.panes[self.focus].launch(rows, cols).is_err() {
+            // el agente puede no estar instalado: se avisa y se sigue, hay otros en la lista
+            self.notice =
+                Some(format!("no se pudo lanzar `{}`", self.panes[self.focus].agent_cmd()));
         }
     }
 
@@ -242,6 +278,21 @@ impl App {
                 _ => self.mode = Mode::Cwd(input),
             },
 
+            Mode::Agents(sel) => {
+                let last = agents().len() - 1;
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.mode = Mode::Agents(if sel == 0 { last } else { sel - 1 });
+                    }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                        self.mode = Mode::Agents(if sel == last { 0 } else { sel + 1 });
+                    }
+                    KeyCode::Enter => self.panes[self.focus].set_agent(sel),
+                    KeyCode::Esc => {}
+                    _ => self.mode = Mode::Agents(sel),
+                }
+            }
+
             Mode::Leader => match key.code {
                 KeyCode::Char(c @ '1'..='9') => {
                     let i = c as usize - '1' as usize;
@@ -268,6 +319,10 @@ impl App {
                 KeyCode::Char('c') => {
                     self.mode = Mode::Cwd(short_path(&self.panes[self.focus].cwd));
                 }
+                // el guard deja pasar ^A ^A al agente
+                KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.mode = Mode::Agents(self.panes[self.focus].agent_index());
+                }
                 // Ctrl+A Ctrl+A envía un Ctrl+A de verdad al agente
                 _ => self.send_key(key),
             },
@@ -288,6 +343,67 @@ impl App {
         }
     }
 
+    /// El ratón enfoca paneles, elige en la lista de agentes y, si el agente pidió
+    /// que le reportemos el ratón, se lo pasamos tal cual.
+    fn on_mouse(&mut self, m: MouseEvent, area: Rect) {
+        let point = Rect::new(m.column, m.row, 1, 1);
+        let inside = |r: Rect| r.union(point) == r;
+
+        if let Mode::Agents(sel) = self.mode {
+            let popup = agents_popup(area);
+            let row =
+                m.row.checked_sub(popup.y + 1).map(usize::from).filter(|i| *i < agents().len());
+            match m.kind {
+                MouseEventKind::ScrollUp => {
+                    self.mode = Mode::Agents(sel.saturating_sub(1));
+                }
+                MouseEventKind::ScrollDown => {
+                    self.mode = Mode::Agents((sel + 1).min(agents().len() - 1));
+                }
+                MouseEventKind::Down(MouseButton::Left) if inside(popup) => match row {
+                    // un clic sobre una fila la elige y cierra: no hace falta el Enter
+                    Some(i) => {
+                        self.panes[self.focus].set_agent(i);
+                        self.mode = Mode::Normal;
+                    }
+                    None => self.mode = Mode::Agents(sel),
+                },
+                // clic fuera del popup: cancelar
+                MouseEventKind::Down(_) => self.mode = Mode::Normal,
+                _ => {}
+            }
+            return;
+        }
+
+        let slots = self.layout(body_of(area));
+        let Some(i) = slots.iter().position(|r| !r.is_empty() && inside(*r)) else { return };
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            self.notice = None;
+            self.focus = i;
+            self.mode = Mode::Normal;
+            // el título lleva el nombre del agente: clic ahí = abrir la lista
+            if m.row == slots[i].y {
+                self.mode = Mode::Agents(self.panes[i].agent_index());
+                return;
+            }
+        }
+        if i != self.focus {
+            return; // el resto de eventos son del panel enfocado, no del que se sobrevuela
+        }
+        // coordenadas dentro del panel, descontando el borde
+        let (Some(col), Some(row)) =
+            (m.column.checked_sub(slots[i].x + 1), m.row.checked_sub(slots[i].y + 1))
+        else {
+            return;
+        };
+        if let Some(session) = self.panes[i].session.as_mut()
+            && session.wants_mouse()
+            && let Some(bytes) = encode_mouse(m, col, row)
+        {
+            session.send(&bytes);
+        }
+    }
+
     fn send_key(&mut self, key: KeyEvent) {
         if let (Some(session), Some(bytes)) =
             (self.panes[self.focus].session.as_mut(), encode_key(key))
@@ -297,13 +413,13 @@ impl App {
     }
 }
 
-fn idle_card(focused: bool) -> Paragraph<'static> {
+fn idle_card(agent: &'static str, focused: bool) -> Paragraph<'static> {
     let accent = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(DIM);
     Paragraph::new(vec![
         Line::from(""),
         Line::from(Span::styled("✻", accent)),
-        Line::from(Span::styled("Claude Code", dim)),
+        Line::from(Span::styled(agent, dim)),
         Line::from(""),
         Line::from(Span::styled(
             if focused { "Enter para lanzar" } else { "" },
@@ -329,6 +445,47 @@ fn grid_shape(n: usize) -> (usize, usize) {
 fn fits(n: usize, area: Rect) -> bool {
     let (cols, rows) = grid_shape(n);
     area.width / cols as u16 >= MIN_PANE_W && area.height / rows as u16 >= MIN_PANE_H
+}
+
+/// Recuadro de la lista de agentes. Lo comparten el dibujo y el ratón, así que la
+/// fila que ves es exactamente la que se clica.
+fn agents_popup(area: Rect) -> Rect {
+    let widest = agents().iter().map(|a| a.chars().count()).max().unwrap_or(10) as u16;
+    // el mínimo es lo que mide el título del recuadro
+    centered(
+        area,
+        (widest + 8).max(24).min(area.width),
+        (agents().len() as u16 + 2).min(area.height),
+    )
+}
+
+/// Traduce un evento de ratón al reporte SGR que espera una TUI (`\x1b[<b;col;rowM`).
+/// Coordenadas relativas al interior del panel, base 1.
+fn encode_mouse(m: MouseEvent, col: u16, row: u16) -> Option<Vec<u8>> {
+    let button = |b| match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    let (mut code, press) = match m.kind {
+        MouseEventKind::Down(b) => (button(b), true),
+        MouseEventKind::Up(b) => (button(b), false),
+        MouseEventKind::Drag(b) => (button(b) + 32, true),
+        MouseEventKind::ScrollUp => (64, true),
+        MouseEventKind::ScrollDown => (65, true),
+        MouseEventKind::ScrollLeft => (66, true),
+        MouseEventKind::ScrollRight => (67, true),
+        MouseEventKind::Moved => return None,
+    };
+    for (modifier, bit) in
+        [(KeyModifiers::SHIFT, 4), (KeyModifiers::ALT, 8), (KeyModifiers::CONTROL, 16)]
+    {
+        if m.modifiers.contains(modifier) {
+            code += bit;
+        }
+    }
+    let end = if press { 'M' } else { 'm' };
+    Some(format!("\x1b[<{code};{};{}{end}", col + 1, row + 1).into_bytes())
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -423,11 +580,11 @@ fn cwds_from_args() -> Result<Vec<PathBuf>> {
 fn main() -> Result<()> {
     let mut app = App::new(cwds_from_args()?);
     let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableBracketedPaste)?;
+    execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
 
     let result = run(&mut app, &mut terminal);
 
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -440,6 +597,7 @@ fn run(app: &mut App, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         if event::poll(std::time::Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key, area),
+                Event::Mouse(m) => app.on_mouse(m, area),
                 Event::Paste(text) => {
                     if let Some(session) = app.panes[app.focus].session.as_mut() {
                         session.send(format!("\x1b[200~{text}\x1b[201~").as_bytes());
@@ -479,7 +637,7 @@ mod tests {
         println!("{screen}");
 
         assert_eq!(screen.matches('✻').count(), 8, "4 títulos + 4 tarjetas idle");
-        assert!(screen.contains("agent 4"));
+        assert!(screen.contains("claude 4"), "el título lleva el agente del panel");
         assert!(screen.contains("Enter para lanzar"), "solo el panel enfocado lo muestra");
     }
 
@@ -502,6 +660,15 @@ mod tests {
         app.on_key(ctrl_a, area);
         app.on_key(KeyEvent::from(KeyCode::Char('z')), area);
         assert!(app.zoom);
+
+        let before = app.panes[app.focus].agent_cmd();
+        app.on_key(ctrl_a, area);
+        app.on_key(KeyEvent::from(KeyCode::Char('a')), area);
+        assert!(matches!(app.mode, Mode::Agents(_)), "^A a abre la lista de agentes");
+        app.on_key(KeyEvent::from(KeyCode::Down), area);
+        app.on_key(KeyEvent::from(KeyCode::Enter), area);
+        assert_ne!(app.panes[app.focus].agent_cmd(), before, "y elegir cambia de IA");
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     /// La rejilla se recalcula al crecer y ninguna celda se solapa ni se sale.
@@ -591,5 +758,110 @@ mod tests {
         let slots = app.layout(area);
         assert_eq!(slots[2], area);
         assert!(slots.iter().enumerate().all(|(i, r)| i == 2 || r.is_empty()));
+    }
+
+    /// La lista se dibuja encima de la rejilla y marca el agente en uso.
+    #[test]
+    fn agent_list_renders_over_the_grid() {
+        let mut app = App::new(vec![PathBuf::from("/tmp")]);
+        app.mode = Mode::Agents(1);
+        let mut terminal = Terminal::new(TestBackend::new(76, 20)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(76)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("{screen}");
+
+        assert!(screen.contains("agente del panel 1"));
+        for agent in agents() {
+            assert!(screen.contains(agent.as_str()), "falta {agent} en la lista");
+        }
+        assert!(screen.contains("✻ claude"), "el agente en uso va marcado");
+    }
+
+    fn click(app: &mut App, kind: MouseEventKind, x: u16, y: u16, area: Rect) {
+        app.on_mouse(
+            MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::empty() },
+            area,
+        );
+    }
+
+    /// El ratón enfoca el panel que se clica, y su barra de título abre la lista.
+    #[test]
+    fn clicking_focuses_a_pane_and_its_title_opens_the_agent_list() {
+        let mut app = App::new(vec![PathBuf::from("/tmp")]);
+        let area = Rect::new(0, 0, 80, 25);
+        let bottom_right = app.layout(body_of(area))[3];
+
+        click(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            bottom_right.x + 5,
+            area.height - 3,
+            area,
+        );
+        assert_eq!(app.focus, 3);
+        assert!(matches!(app.mode, Mode::Normal), "el cuerpo del panel solo enfoca");
+
+        click(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            bottom_right.x + 5,
+            bottom_right.y,
+            area,
+        );
+        assert!(matches!(app.mode, Mode::Agents(_)), "el título abre la lista");
+    }
+
+    /// Y dentro de la lista, la fila que se ve es la que se elige.
+    #[test]
+    fn clicking_a_row_picks_that_agent() {
+        let mut app = App::new(vec![PathBuf::from("/tmp")]);
+        let area = Rect::new(0, 0, 80, 25);
+        let popup = agents_popup(area);
+        app.mode = Mode::Agents(0);
+
+        let last = agents().len() - 1;
+        click(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            popup.x + 3,
+            popup.y + 1 + last as u16,
+            area,
+        );
+        assert!(matches!(app.mode, Mode::Normal), "elegir cierra la lista");
+        assert_eq!(app.panes[0].agent_index(), last);
+
+        app.mode = Mode::Agents(0);
+        click(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0, area);
+        assert!(matches!(app.mode, Mode::Normal), "clic fuera cancela");
+    }
+
+    #[test]
+    fn mouse_reports_are_sgr_and_relative_to_the_pane() {
+        let ev = |kind| MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::empty() };
+        let sgr = |kind, c, r| String::from_utf8(encode_mouse(ev(kind), c, r).unwrap()).unwrap();
+
+        assert_eq!(sgr(MouseEventKind::Down(MouseButton::Left), 0, 0), "\x1b[<0;1;1M");
+        assert_eq!(sgr(MouseEventKind::Up(MouseButton::Right), 9, 4), "\x1b[<2;10;5m");
+        assert_eq!(sgr(MouseEventKind::ScrollUp, 0, 0), "\x1b[<64;1;1M");
+        assert!(encode_mouse(ev(MouseEventKind::Moved), 0, 0).is_none(), "no se reporta el vuelo");
+
+        let ctrl_scroll = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        assert_eq!(
+            String::from_utf8(encode_mouse(ctrl_scroll, 0, 0).unwrap()).unwrap(),
+            "\x1b[<81;1;1M"
+        );
     }
 }
